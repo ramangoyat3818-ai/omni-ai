@@ -1,0 +1,8 @@
+{
+  "name": "Omni One",
+  "description": "A universal AI assistant for chat, image generation, and multimodal tasks.",
+  "requestFramePermissions": [
+    "camera",
+    "microphone"
+  ]
+}
