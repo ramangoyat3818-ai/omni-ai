@@ -15,31 +15,49 @@ import {
   Command,
   Search,
   Menu,
-  X
+  X,
+  LogOut,
+  LogIn
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { cn } from './lib/utils';
 import { chatWithGemini, generateImage } from './lib/gemini';
+import { auth, db, signIn, logout } from './lib/firebase';
+import { useAuthState } from 'react-firebase-hooks/auth';
+import { 
+  collection, 
+  addDoc, 
+  query, 
+  orderBy, 
+  onSnapshot, 
+  serverTimestamp, 
+  doc, 
+  setDoc,
+  deleteDoc,
+  getDocs,
+  limit
+} from 'firebase/firestore';
 
 interface Message {
   id: string;
   role: 'user' | 'assistant';
   content: string;
   type: 'text' | 'image';
-  timestamp: Date;
+  timestamp: any;
+}
+
+interface Session {
+  id: string;
+  title: string;
+  updatedAt: any;
 }
 
 export default function App() {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      id: '1',
-      role: 'assistant',
-      content: "Hello! I'm Omni One. How can I assist you today?",
-      type: 'text',
-      timestamp: new Date(),
-    }
-  ]);
+  const [user, loadingAuth] = useAuthState(auth);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [sessions, setSessions] = useState<Session[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(true);
@@ -54,43 +72,119 @@ export default function App() {
     scrollToBottom();
   }, [messages]);
 
-  const handleSend = async () => {
-    if (!input.trim() || isLoading) return;
+  // Fetch sessions
+  useEffect(() => {
+    if (!user) {
+      setSessions([]);
+      setActiveSessionId(null);
+      return;
+    }
 
-    const userMessage: Message = {
-      id: Date.now().toString(),
-      role: 'user',
+    const q = query(
+      collection(db, `users/${user.uid}/sessions`),
+      orderBy('updatedAt', 'desc'),
+      limit(20)
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const sessionList = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      })) as Session[];
+      setSessions(sessionList);
+      
+      if (sessionList.length > 0 && !activeSessionId) {
+        setActiveSessionId(sessionList[0].id);
+      }
+    });
+
+    return () => unsubscribe();
+  }, [user]);
+
+  // Fetch messages for active session
+  useEffect(() => {
+    if (!user || !activeSessionId) {
+      setMessages([]);
+      return;
+    }
+
+    const q = query(
+      collection(db, `users/${user.uid}/sessions/${activeSessionId}/messages`),
+      orderBy('timestamp', 'asc')
+    );
+
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const messageList = snapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data()
+      })) as Message[];
+      setMessages(messageList);
+    });
+
+    return () => unsubscribe();
+  }, [user, activeSessionId]);
+
+  const createNewSession = async () => {
+    if (!user) return;
+    const sessionRef = await addDoc(collection(db, `users/${user.uid}/sessions`), {
+      title: 'New Session',
+      updatedAt: serverTimestamp(),
+      createdAt: serverTimestamp(),
+    });
+    setActiveSessionId(sessionRef.id);
+  };
+
+  const handleSend = async () => {
+    if (!input.trim() || isLoading || !user) return;
+
+    let currentSessionId = activeSessionId;
+    if (!currentSessionId) {
+      const sessionRef = await addDoc(collection(db, `users/${user.uid}/sessions`), {
+        title: input.slice(0, 30) + '...',
+        updatedAt: serverTimestamp(),
+        createdAt: serverTimestamp(),
+      });
+      currentSessionId = sessionRef.id;
+      setActiveSessionId(currentSessionId);
+    }
+
+    const userMessage = {
+      role: 'user' as const,
       content: input,
-      type: 'text',
-      timestamp: new Date(),
+      type: 'text' as const,
+      timestamp: serverTimestamp(),
     };
 
-    setMessages(prev => [...prev, userMessage]);
+    await addDoc(collection(db, `users/${user.uid}/sessions/${currentSessionId}/messages`), userMessage);
     setInput('');
     setIsLoading(true);
 
     try {
       if (activeMode === 'chat') {
         const response = await chatWithGemini(input);
-        const assistantMessage: Message = {
-          id: (Date.now() + 1).toString(),
-          role: 'assistant',
+        const assistantMessage = {
+          role: 'assistant' as const,
           content: response || "I'm sorry, I couldn't process that.",
-          type: 'text',
-          timestamp: new Date(),
+          type: 'text' as const,
+          timestamp: serverTimestamp(),
         };
-        setMessages(prev => [...prev, assistantMessage]);
+        await addDoc(collection(db, `users/${user.uid}/sessions/${currentSessionId}/messages`), assistantMessage);
       } else {
         const imageUrl = await generateImage(input);
-        const assistantMessage: Message = {
-          id: (Date.now() + 1).toString(),
-          role: 'assistant',
+        const assistantMessage = {
+          role: 'assistant' as const,
           content: imageUrl || "I'm sorry, I couldn't generate that image.",
-          type: 'image',
-          timestamp: new Date(),
+          type: 'image' as const,
+          timestamp: serverTimestamp(),
         };
-        setMessages(prev => [...prev, assistantMessage]);
+        await addDoc(collection(db, `users/${user.uid}/sessions/${currentSessionId}/messages`), assistantMessage);
       }
+      
+      // Update session timestamp and title if it's the first message
+      await setDoc(doc(db, `users/${user.uid}/sessions`, currentSessionId), {
+        updatedAt: serverTimestamp(),
+      }, { merge: true });
+
     } catch (error) {
       console.error("Error:", error);
     } finally {
@@ -98,15 +192,40 @@ export default function App() {
     }
   };
 
-  const clearChat = () => {
-    setMessages([{
-      id: '1',
-      role: 'assistant',
-      content: "Chat cleared. How else can I help?",
-      type: 'text',
-      timestamp: new Date(),
-    }]);
-  };
+  if (loadingAuth) {
+    return (
+      <div className="h-screen bg-[#0a0a0a] flex items-center justify-center">
+        <Loader2 className="w-8 h-8 animate-spin text-white/40" />
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <div className="h-screen bg-[#0a0a0a] flex flex-col items-center justify-center p-6 text-center">
+        <motion.div 
+          initial={{ scale: 0.9, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          className="max-w-md w-full glass p-10 rounded-[2.5rem] space-y-8"
+        >
+          <div className="w-16 h-16 rounded-2xl bg-white flex items-center justify-center mx-auto">
+            <Command className="text-black w-10 h-10" />
+          </div>
+          <div className="space-y-2">
+            <h1 className="text-3xl font-bold tracking-tight">Omni One</h1>
+            <p className="text-white/40 text-sm">Universal AI Intelligence. Sign in to begin your journey.</p>
+          </div>
+          <button 
+            onClick={signIn}
+            className="w-full py-4 px-6 rounded-2xl bg-white text-black font-bold flex items-center justify-center gap-3 hover:bg-white/90 transition-all"
+          >
+            <LogIn className="w-5 h-5" />
+            Continue with Google
+          </button>
+        </motion.div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-screen bg-[#0a0a0a] text-white overflow-hidden font-sans">
@@ -128,7 +247,7 @@ export default function App() {
 
             <div className="px-4 mb-6">
               <button 
-                onClick={clearChat}
+                onClick={createNewSession}
                 className="w-full py-3 px-4 rounded-xl glass-hover glass flex items-center gap-3 text-sm font-medium"
               >
                 <Plus className="w-4 h-4" />
@@ -160,21 +279,37 @@ export default function App() {
               </button>
 
               <div className="pt-8 text-[10px] uppercase tracking-widest text-white/40 font-bold px-4 mb-2">History</div>
-              {/* Mock history items */}
               <div className="space-y-1">
-                {['Project Alpha', 'Design Review', 'Market Analysis'].map((item, i) => (
-                  <button key={i} className="w-full py-2 px-4 rounded-lg glass-hover text-white/40 text-xs text-left flex items-center gap-2">
-                    <MessageSquare className="w-3 h-3" />
-                    {item}
+                {sessions.map((session) => (
+                  <button 
+                    key={session.id} 
+                    onClick={() => setActiveSessionId(session.id)}
+                    className={cn(
+                      "w-full py-2 px-4 rounded-lg text-xs text-left flex items-center gap-2 transition-all",
+                      activeSessionId === session.id ? "bg-white/10 text-white" : "glass-hover text-white/40"
+                    )}
+                  >
+                    <MessageSquare className="w-3 h-3 shrink-0" />
+                    <span className="truncate">{session.title}</span>
                   </button>
                 ))}
               </div>
             </nav>
 
-            <div className="p-4 border-t border-white/10">
-              <button className="w-full py-3 px-4 rounded-xl glass-hover flex items-center gap-3 text-sm text-white/60">
-                <Settings className="w-4 h-4" />
-                Settings
+            <div className="p-4 border-t border-white/10 space-y-2">
+              <div className="flex items-center gap-3 px-4 py-2">
+                <img src={user.photoURL || ''} className="w-8 h-8 rounded-full border border-white/10" referrerPolicy="no-referrer" />
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs font-medium truncate">{user.displayName}</p>
+                  <p className="text-[10px] text-white/40 truncate">{user.email}</p>
+                </div>
+              </div>
+              <button 
+                onClick={logout}
+                className="w-full py-3 px-4 rounded-xl glass-hover flex items-center gap-3 text-sm text-white/60"
+              >
+                <LogOut className="w-4 h-4" />
+                Sign Out
               </button>
             </div>
           </motion.aside>
@@ -199,22 +334,27 @@ export default function App() {
               </span>
             </div>
           </div>
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-full glass flex items-center justify-center">
-              <User className="w-4 h-4" />
-            </div>
-          </div>
         </header>
 
         {/* Messages */}
         <div className="flex-1 overflow-y-auto p-6 space-y-8 scrollbar-hide">
           <div className="max-w-3xl mx-auto w-full space-y-8">
+            {messages.length === 0 && !isLoading && (
+              <div className="h-full flex flex-col items-center justify-center text-center space-y-4 pt-20">
+                <div className="w-16 h-16 rounded-3xl glass flex items-center justify-center">
+                  <Bot className="w-8 h-8 text-white/20" />
+                </div>
+                <div className="space-y-1">
+                  <h2 className="text-xl font-semibold">Start a new conversation</h2>
+                  <p className="text-sm text-white/40">Omni One is ready to help you with anything.</p>
+                </div>
+              </div>
+            )}
             {messages.map((msg, index) => (
               <motion.div
                 key={msg.id}
                 initial={{ y: 20, opacity: 0 }}
                 animate={{ y: 0, opacity: 1 }}
-                transition={{ delay: index * 0.05 }}
                 className={cn(
                   "flex gap-4",
                   msg.role === 'user' ? "flex-row-reverse" : ""
@@ -252,9 +392,6 @@ export default function App() {
                       </div>
                     )}
                   </div>
-                  <span className="text-[10px] text-white/20 px-1">
-                    {msg.timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                  </span>
                 </div>
               </motion.div>
             ))}
@@ -280,12 +417,6 @@ export default function App() {
         {/* Input Area */}
         <div className="p-6">
           <div className="max-w-3xl mx-auto relative">
-            <div className="absolute -top-12 left-0 right-0 flex justify-center pointer-events-none">
-              <div className="glass px-4 py-1.5 rounded-full text-[10px] text-white/40 font-medium flex items-center gap-2">
-                <Search className="w-3 h-3" />
-                Omni One is ready for your command
-              </div>
-            </div>
             <div className="relative group">
               <textarea
                 value={input}
@@ -311,9 +442,6 @@ export default function App() {
                 {isLoading ? <Loader2 className="w-5 h-5 animate-spin" /> : <Send className="w-5 h-5" />}
               </button>
             </div>
-            <p className="text-[10px] text-center mt-3 text-white/20">
-              Omni One can make mistakes. Check important info.
-            </p>
           </div>
         </div>
 
